@@ -1,0 +1,25 @@
+{
+  "name": "cursor-to-claude",
+  "version": "1.0.0",
+  "description": "Convert Cursor project rules into Claude Code rules without losing path scope.",
+  "type": "module",
+  "bin": {
+    "cursor-to-claude": "bin/cursor-to-claude.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "convert": "node bin/cursor-to-claude.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
+  },
+  "license": "UNLICENSED"
+}
