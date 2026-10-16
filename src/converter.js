@@ -5,6 +5,10 @@ import { parseDocument, stringify } from "yaml";
 
 const SOURCE_DIRECTORY = path.join(".cursor", "rules");
 const OUTPUT_DIRECTORY = path.join(".claude", "rules", "cursor");
+const SKILLS_DIRECTORY = path.join(".claude", "skills");
+const SKILL_PREFIX = "cursor-";
+const SKILL_MARKER = ".cursor-to-claude";
+const MAX_SKILL_NAME_LENGTH = 64;
 
 export class ConversionError extends Error {}
 
@@ -145,9 +149,89 @@ export function convertRule(source, sourceName = "rule.mdc") {
   }
 
   if (description?.trim()) {
-    return { kind: "skipped-intelligent" };
+    return { kind: "intelligent", description: description.trim(), body };
   }
-  return { kind: "skipped-manual" };
+  return { kind: "manual", body };
+}
+
+export function skillNameFor(sourceRelative) {
+  const stem = relativeDisplayPath(sourceRelative)
+    .replace(/\.mdc$/, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `${SKILL_PREFIX}${stem}`.slice(0, MAX_SKILL_NAME_LENGTH).replace(/-+$/, "");
+}
+
+export function renderSkill(result, name, displayName) {
+  const metadata =
+    result.kind === "intelligent"
+      ? { name, description: result.description, "user-invocable": false }
+      : {
+          name,
+          description: `Cursor rule ${displayName}, applied manually`,
+          "disable-model-invocation": true,
+        };
+  const frontmatter = stringify(metadata, { lineWidth: 0 }).trimEnd();
+  return `---\n${frontmatter}\n---\n\n${result.body}`;
+}
+
+async function exists(target) {
+  try {
+    await fs.lstat(target);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function findManagedSkills(skillsDirectory) {
+  let entries;
+  try {
+    entries = await fs.readdir(skillsDirectory, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  const managed = [];
+  for (const entry of entries) {
+    if (
+      entry.isDirectory() &&
+      (await exists(path.join(skillsDirectory, entry.name, SKILL_MARKER)))
+    ) {
+      managed.push(entry.name);
+    }
+  }
+  return managed;
+}
+
+async function replaceSkills(skillsDirectory, skills) {
+  await fs.mkdir(skillsDirectory, { recursive: true });
+  const generated = new Set(skills.map((skill) => skill.name));
+
+  for (const skill of skills) {
+    const destination = path.join(skillsDirectory, skill.name);
+    const temporaryDirectory = path.join(
+      skillsDirectory,
+      `.${skill.name}.tmp-${process.pid}-${randomUUID()}`,
+    );
+    await fs.mkdir(temporaryDirectory);
+    await fs.writeFile(path.join(temporaryDirectory, "SKILL.md"), skill.content, "utf8");
+    await fs.writeFile(
+      path.join(temporaryDirectory, SKILL_MARKER),
+      `Generated from ${skill.source} by cursor-to-claude. Edit the Cursor rule instead.\n`,
+      "utf8",
+    );
+    await fs.rm(destination, { recursive: true, force: true });
+    await fs.rename(temporaryDirectory, destination);
+  }
+
+  for (const name of await findManagedSkills(skillsDirectory)) {
+    if (!generated.has(name)) {
+      await fs.rm(path.join(skillsDirectory, name), { recursive: true, force: true });
+    }
+  }
 }
 
 async function writeGeneratedTree(temporaryDirectory, converted) {
@@ -201,12 +285,16 @@ export async function convertProject({ root = process.cwd(), dryRun = false } = 
   const projectRoot = path.resolve(root);
   const sourceDirectory = path.join(projectRoot, SOURCE_DIRECTORY);
   const outputDirectory = path.join(projectRoot, OUTPUT_DIRECTORY);
+  const skillsDirectory = path.join(projectRoot, SKILLS_DIRECTORY);
   const sourceFiles = await findMdcFiles(sourceDirectory);
+  const managedSkills = new Set(await findManagedSkills(skillsDirectory));
   const converted = [];
+  const skills = [];
   const warnings = [];
-  let skippedIntelligent = 0;
-  let skippedManual = 0;
+  let intelligentSkills = 0;
+  let manualSkills = 0;
   const outputKeys = new Map();
+  const skillKeys = new Map();
 
   for (const sourceRelative of sourceFiles) {
     const displayName = relativeDisplayPath(
@@ -215,14 +303,29 @@ export async function convertProject({ root = process.cwd(), dryRun = false } = 
     const source = await fs.readFile(path.join(sourceDirectory, sourceRelative), "utf8");
     const result = convertRule(source, displayName);
 
-    if (result.kind === "skipped-intelligent") {
-      skippedIntelligent += 1;
-      warnings.push(`${displayName}: skipped intelligent rule (no Claude equivalent)`);
-      continue;
-    }
-    if (result.kind === "skipped-manual") {
-      skippedManual += 1;
-      warnings.push(`${displayName}: skipped manual rule (no Claude equivalent)`);
+    if (result.kind === "intelligent" || result.kind === "manual") {
+      const name = skillNameFor(sourceRelative);
+      if (skillKeys.has(name)) {
+        throw new ConversionError(
+          `skill name collision: ${skillKeys.get(name)} and ${displayName} both map to ${name}`,
+        );
+      }
+      if (
+        !managedSkills.has(name) &&
+        (await exists(path.join(skillsDirectory, name)))
+      ) {
+        throw new ConversionError(
+          `${displayName}: ${relativeDisplayPath(path.join(SKILLS_DIRECTORY, name))} exists and was not generated by cursor-to-claude`,
+        );
+      }
+      skillKeys.set(name, displayName);
+      skills.push({
+        name,
+        source: displayName,
+        content: renderSkill(result, name, displayName),
+      });
+      if (result.kind === "intelligent") intelligentSkills += 1;
+      else manualSkills += 1;
       continue;
     }
 
@@ -237,24 +340,28 @@ export async function convertProject({ root = process.cwd(), dryRun = false } = 
     converted.push({ outputRelative, content: result.content });
   }
 
-  if (!dryRun) await replaceOutput(outputDirectory, converted);
+  if (!dryRun) {
+    await replaceOutput(outputDirectory, converted);
+    await replaceSkills(skillsDirectory, skills);
+  }
 
   return {
     discovered: sourceFiles.length,
     converted: converted.length,
-    skippedIntelligent,
-    skippedManual,
+    intelligentSkills,
+    manualSkills,
     warnings,
     outputDirectory,
+    skillsDirectory,
   };
 }
 
 export function formatSummary(result, dryRun = false) {
   const prefix = dryRun ? "Dry run: " : "";
   return (
-    `${prefix}${result.converted} converted, ` +
-    `${result.skippedIntelligent} intelligent skipped, ` +
-    `${result.skippedManual} manual skipped, ` +
+    `${prefix}${result.converted} converted to rules, ` +
+    `${result.intelligentSkills} intelligent to skills, ` +
+    `${result.manualSkills} manual to skills, ` +
     `${result.discovered} total`
   );
 }
