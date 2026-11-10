@@ -3,8 +3,7 @@ import { convertProject, formatSummary } from "./converter.js";
 
 const HELP = `Usage: cursor-to-claude [options]
 
-Convert .cursor/rules/**/*.mdc into .claude/rules/cursor/**/*.md, and
-description-only or manual rules into .claude/skills/cursor-*/SKILL.md.
+Convert .cursor/rules/**/*.mdc into .claude/rules/cursor/**/*.md.
 
 Options:
   --root <path>  Project root (default: current working directory)
